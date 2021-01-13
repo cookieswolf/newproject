@@ -278,7 +278,7 @@ impl pallet_kitties::Trait for Runtime {
 	type Event = Event;
 	type Randomness = RandomnessCollectiveFlip;
 	type KittyIndex = u32;
-	//type Currency = Balances;
+	type Currency = Balances;
 }
 impl pallet_erc20::Trait for Runtime {
 	type Event = Event;

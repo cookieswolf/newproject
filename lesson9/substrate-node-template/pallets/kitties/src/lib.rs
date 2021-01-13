@@ -1,8 +1,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use codec::{Encode, Decode};
-use frame_support::{decl_module, decl_storage, decl_event, decl_error, ensure,Parameter,
-                    traits::{Randomness,Currency,ReservableCurrency},
+use frame_support::{decl_module, decl_storage, decl_event, decl_error, ensure,Parameter,dispatch::DispatchResult,
+                    traits::{Randomness,Currency, ExistenceRequirement::AllowDeath, ReservableCurrency},
 };
 use sp_io::hashing::blake2_128; 
 use frame_system::{self as system, ensure_signed};
@@ -11,7 +11,8 @@ use crate::doublelinkedlist::{LinkedList, LinkedItem};
 //设计的数据结构双链表 
 mod doublelinkedlist;
 
- 
+#[cfg(test)]
+mod mock;
 
 //type KittyIndex = u32;
 
@@ -24,9 +25,10 @@ pub trait Trait: frame_system::Trait {
     type Randomness: Randomness<Self::Hash>;
     //KittyIndex
     type KittyIndex: Parameter + Member + AtLeast32Bit + Bounded + Default + Copy;
-    //type Currency: Currency<Self::AccountId>+ReservableCurrency<Self::AccountId>;
+    type Currency: Currency<Self::AccountId>+ReservableCurrency<Self::AccountId>;
 }
-//type BalanceOf<T> = <<T as Trait>::Currency as Currency<<T as frame_system::Trait>::AccountId>>::Balance;
+type BalanceOf<T> = <<T as Trait>::Currency as Currency<<T as frame_system::Trait>::AccountId>>::Balance;
+
 type KittyLinkedItem<T> = LinkedItem<<T as Trait>::KittyIndex>;
 type OwnerKittiesList<T> = LinkedList<OwnerKitties<T>, <T as system::Trait>::AccountId, <T as Trait>::KittyIndex>;
 decl_storage! {
@@ -43,10 +45,16 @@ decl_storage! {
 
 decl_event!(
     pub enum Event<T> where AccountId = <T as frame_system::Trait>::AccountId,
-    KittyIndex = <T as Trait>::KittyIndex
+    KittyIndex = <T as Trait>::KittyIndex,
+    Balance = BalanceOf<T>,
+	BlockNumber = <T as system::Trait>::BlockNumber,
     {
 		Created(AccountId, KittyIndex),
-		Transferred(AccountId, AccountId, KittyIndex),
+        Transferred(AccountId, AccountId, KittyIndex),
+        LockFunds(AccountId, Balance, BlockNumber),
+		UnlockFunds(AccountId, Balance, BlockNumber),
+		// sender, dest, amount, block number
+		TransferFunds(AccountId, AccountId, Balance, BlockNumber),
 	}
 );
 
@@ -96,6 +104,68 @@ decl_module! {
             let sender = ensure_signed(origin)?;
             let new_kitty_id = Self::do_breed(&sender, kitty_id_1, kitty_id_2)?;
 			Self::deposit_event(RawEvent::Created(sender, new_kitty_id));
+        }
+        
+        #[weight = 10_000]
+		pub fn reserve_funds(origin, amount: BalanceOf<T>) -> DispatchResult {
+			let locker = ensure_signed(origin)?;
+
+			T::Currency::reserve(&locker, amount)
+					.map_err(|_| "locker can't afford to lock the amount requested")?;
+
+			let now = <system::Module<T>>::block_number();
+
+			Self::deposit_event(RawEvent::LockFunds(locker, amount, now));
+			Ok(())
+		}
+
+		/// Unreserves the specified amount of funds from the caller
+		#[weight = 10_000]
+		pub fn unreserve_funds(origin, amount: BalanceOf<T>) -> DispatchResult {
+			let unlocker = ensure_signed(origin)?;
+
+			T::Currency::unreserve(&unlocker, amount);
+			// ReservableCurrency::unreserve does not fail (it will lock up as much as amount)
+
+			let now = <system::Module<T>>::block_number();
+
+			Self::deposit_event(RawEvent::UnlockFunds(unlocker, amount, now));
+			Ok(())
+		}
+
+		/// Transfers funds. Essentially a wrapper around the Currency's own transfer method
+		#[weight = 10_000]
+		pub fn transfer_funds(origin, dest: T::AccountId, amount: BalanceOf<T>) -> DispatchResult {
+			let sender = ensure_signed(origin)?;
+
+			T::Currency::transfer(&sender, &dest, amount, AllowDeath)?;
+
+			let now = <system::Module<T>>::block_number();
+
+			Self::deposit_event(RawEvent::TransferFunds(sender, dest, amount, now));
+			Ok(())
+		}
+
+		/// Atomically unreserves funds and and transfers them.
+		/// might be useful in closed economic systems
+		#[weight = 10_000]
+		pub fn unreserve_and_transfer(
+			origin,
+			to_punish: T::AccountId,
+			dest: T::AccountId,
+			collateral: BalanceOf<T>
+		) -> DispatchResult {
+			let _ = ensure_signed(origin)?; // dangerous because can be called with any signature (so dont do this in practice ever!)
+
+						// If collateral is bigger than to_punish's reserved_balance, store what's left in overdraft.
+			let overdraft = T::Currency::unreserve(&to_punish, collateral);
+
+			T::Currency::transfer(&to_punish, &dest, collateral - overdraft, AllowDeath)?;
+
+			let now = <system::Module<T>>::block_number();
+			Self::deposit_event(RawEvent::TransferFunds(to_punish, dest, collateral - overdraft, now));
+
+			Ok(())
 		}
 
 	}
@@ -158,115 +228,6 @@ impl<T: Trait> Module<T> {
         Self::insert_kitty(sender, kitty_id, Kitty(new_dna)); 
         Ok(kitty_id) 
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    //use pallet_balances;
-    use sp_core::H256;
-    use frame_support::{impl_outer_origin, parameter_types, weights::Weight, assert_ok, assert_noop,
-                        traits::{OnFinalize, OnInitialize},
-    };
-     
-    use sp_runtime::{
-        traits::{BlakeTwo256, IdentityLookup}, testing::Header, Perbill,
-    };
     
-    use frame_system as system;
-
-    impl_outer_origin! {
-	    pub enum Origin for Test {}
-    }
-
-    #[derive(Clone, Eq, PartialEq)]
-    pub struct Test;
-    parameter_types! {
-        pub const BlockHashCount: u64 = 250;
-        pub const MaximumBlockWeight: Weight = 1024;
-        pub const MaximumBlockLength: u32 = 2 * 1024;
-        pub const AvailableBlockRatio: Perbill = Perbill::from_percent(75);
-
-        pub const ExistentialDeposit: u64 = 1;
-    }
-
-    impl system::Trait for Test {
-        type BaseCallFilter = ();
-        type Origin = Origin;
-        type Call = ();
-        type Index = u64;
-        type BlockNumber = u64;
-        type Hash = H256;
-        type Hashing = BlakeTwo256;
-        type AccountId = u64;
-        type Lookup = IdentityLookup<Self::AccountId>;
-        type Header = Header;
-        type Event = ();
-        type BlockHashCount = BlockHashCount;
-        type MaximumBlockWeight = MaximumBlockWeight;
-        type DbWeight = ();
-        type BlockExecutionWeight = ();
-        type ExtrinsicBaseWeight = ();
-        type MaximumExtrinsicWeight = MaximumBlockWeight;
-        type MaximumBlockLength = MaximumBlockLength;
-        type AvailableBlockRatio = AvailableBlockRatio;
-        type Version = ();
-        type PalletInfo = ();
-        type AccountData = ();
-        type OnNewAccount = ();
-        type OnKilledAccount = ();
-        type SystemWeightInfo = ();
-    }
-     
-    type Randomness = pallet_randomness_collective_flip::Module<Test>;
-
-    impl Trait for Test {
-        type Event = ();
-        type Randomness = Randomness;
-        type KittyIndex = u32;
-       // type Currency = pallet_balances::Module<Self>;
-        //type Currency = Module<Test>; 
-
-    }
- 
-    pub type Kitties = Module<Test>;
-    pub type System = frame_system::Module<Test>;
-
-    fn run_to_block(n: u64) {
-        while System::block_number() < n {
-            Kitties::on_finalize(System::block_number());
-            System::on_finalize(System::block_number());
-            System::set_block_number(System::block_number() + 1);
-            System::on_initialize(System::block_number());
-            Kitties::on_initialize(System::block_number());
-        }
-    }
-
-    pub fn new_test_ext() -> sp_io::TestExternalities {
-        system::GenesisConfig::default().build_storage::<Test>().unwrap().into()
-    }
-
-    /// 创建kitty
-    #[test]
-    fn owned_kitties_can_append_values() {
-        new_test_ext().execute_with(|| {
-            run_to_block(10);
-            assert_eq!(Kitties::create(Origin::signed(1)), Ok(()))
-        })
-    }
-
-    /// transfer kitty
-    #[test]
-    fn transfer_kitties() {
-        new_test_ext().execute_with(|| {
-            run_to_block(10);
-            assert_ok!(Kitties::create(Origin::signed(1)));
-            let id = Kitties::kitties_count();
-            assert_ok!(Kitties::transfer(Origin::signed(1), 2 , id-1));
-            assert_noop!(
-                Kitties::transfer(Origin::signed(1), 2, id-1),
-                Error::<Test>::NotVerifyKittyOwner
-                );
-        })
-    }
 }
+ 
