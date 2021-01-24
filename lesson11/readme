@@ -1,0 +1,21 @@
+1.因为不是什么敏感信息，原则上是可以使用不签名交易的方式写回到链上。
+这里还是使用了 签名交易，不签名交易， 不签名交易但有签名数据三种方式，交替进行。
+
+fn fetch_polkadot_info(modu:i32){
+	let s_info = StorageValueRef::persistent(b"offchain-demo::gh-info");
+	{
+		match Self::fetch_n_parse() {
+			Ok(gh_info) => { 
+				let result = match modu {
+					0 => Self::offchain_signed_tx(gh_info.data.priceUsd.clone()),
+					1 => Self::offchain_unsigned_tx(gh_info.data.priceUsd.clone()),
+					2 => Self::offchain_unsigned_tx_signed_payload(gh_info.data.priceUsd.clone()),
+					_ => Self::offchain_signed_tx(gh_info.data.priceUsd.clone()),
+				};
+			
+			}
+			Err(err) => {  }
+		}
+	}
+		 
+}
